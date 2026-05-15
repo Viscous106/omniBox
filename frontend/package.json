@@ -19,6 +19,7 @@
     "react-markdown": "^9.1.0",
     "react-router-dom": "^6.30.3",
     "reactflow": "^11.11.4",
+    "simple-icons": "^16.19.0",
     "swr": "^2.4.1"
   },
   "devDependencies": {

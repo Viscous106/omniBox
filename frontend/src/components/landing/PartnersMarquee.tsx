@@ -1,22 +1,58 @@
 import { motion } from "framer-motion";
+import {
+  siAnthropic,
+  siFastapi,
+  siFramer,
+  siReact,
+  siSqlite,
+} from "simple-icons";
 
 const PARTNERS = [
-  { name: "Anthropic",   abbr: "Anthropic" },
-  { name: "Groq",        abbr: "Groq" },
-  { name: "Tavily",      abbr: "Tavily" },
-  { name: "LiteLLM",    abbr: "LiteLLM" },
-  { name: "FastAPI",     abbr: "FastAPI" },
-  { name: "React Flow",  abbr: "ReactFlow" },
-  { name: "Framer",      abbr: "Framer Motion" },
-  { name: "SQLite",      abbr: "SQLite" },
+  { name: "Anthropic", abbr: "Anthropic", icon: siAnthropic, accent: "#D4A373" },
+  { name: "Groq", abbr: "Groq", monogram: "GQ", accent: "#F55036" },
+  { name: "Tavily", abbr: "Tavily", monogram: "TV", accent: "#F97316" },
+  { name: "LiteLLM", abbr: "LiteLLM", monogram: "LL", accent: "#7C3AED" },
+  { name: "FastAPI", abbr: "FastAPI", icon: siFastapi, accent: "#10B981" },
+  { name: "React Flow", abbr: "ReactFlow", icon: siReact, accent: "#61DAFB" },
+  { name: "Framer", abbr: "Framer Motion", icon: siFramer, accent: "#2563EB" },
+  { name: "SQLite", abbr: "SQLite", icon: siSqlite, accent: "#0F80CC" },
 ];
 
-function PartnerLogo({ abbr }: { name: string; abbr: string }) {
+type Partner = (typeof PARTNERS)[number];
+
+function PartnerLogo({ abbr, icon, monogram, accent }: Partner) {
   return (
-    <div className="flex items-center gap-2 px-8 py-4 rounded-xl border border-white/5 bg-white/2 mx-4 group cursor-default hover:border-accent/30 hover:bg-accent/5 transition-all duration-300 shrink-0">
-      {/* Generic geometric icon placeholder */}
-      <div className="w-6 h-6 rounded-md bg-white/10 group-hover:bg-accent/20 transition-colors duration-300 shrink-0" />
-      <span className="text-sm font-medium text-white/30 group-hover:text-white/90 transition-colors duration-300 whitespace-nowrap">
+    <div
+      className="flex items-center gap-3 px-7 py-4 rounded-xl border border-white/6 bg-white/[0.02] mx-4 group cursor-default transition-all duration-300 shrink-0 hover:-translate-y-0.5"
+      style={{
+        boxShadow: `inset 0 0 0 1px rgba(255,255,255,0.02)`,
+      }}
+    >
+      <div
+        className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/8 bg-white/[0.03] shrink-0 transition-colors duration-300"
+        style={{
+          boxShadow: `0 0 0 1px rgba(255,255,255,0.02), 0 12px 30px -22px ${accent}`,
+        }}
+      >
+        {icon ? (
+          <svg
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            className="h-5 w-5 transition-opacity duration-300"
+            style={{ fill: accent, opacity: 0.95 }}
+          >
+            <path d={icon.path} />
+          </svg>
+        ) : (
+          <span
+            className="text-[10px] font-semibold tracking-[0.12em]"
+            style={{ color: accent }}
+          >
+            {monogram}
+          </span>
+        )}
+      </div>
+      <span className="text-sm font-medium text-white/70 group-hover:text-white transition-colors duration-300 whitespace-nowrap">
         {abbr}
       </span>
     </div>

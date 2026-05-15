@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # LLM
     anthropic_api_key: str = ""
     groq_api_key: str = ""
+    orchestrator_model: str = "groq/llama-3.3-70b-versatile"
 
     # Tools
     tavily_api_key: str = ""

@@ -1,17 +1,19 @@
 import json
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 import db
+from config import settings
 from llm import acompletion
 from state import GoalRow
 from tracing import set_execution_context, trace
 
 logger = logging.getLogger(__name__)
 
-ORCHESTRATOR_MODEL = "anthropic/claude-sonnet-4-20250514"
+ORCHESTRATOR_MODEL = settings.orchestrator_model
 
 AGENT_DESCRIPTIONS = """
 Available agents (choose from these only):
@@ -77,6 +79,41 @@ PLAN_TOOL = {
 }
 
 
+TASK_REF_RE = re.compile(r"\{\{(\w+)\.output\.(\w+)\}\}")
+
+
+def _namespace_plan(plan_obj: PlanSchema, goal_id: str) -> PlanSchema:
+    prefix = f"g_{goal_id.split('-', 1)[0]}_"
+    id_map = {task.id: f"{prefix}{task.id}" for task in plan_obj.tasks}
+
+    def rewrite_refs(value: Any) -> Any:
+        if isinstance(value, str):
+            return TASK_REF_RE.sub(
+                lambda match: f"{{{{{id_map.get(match.group(1), match.group(1))}.output.{match.group(2)}}}}}",
+                value,
+            )
+        if isinstance(value, list):
+            return [rewrite_refs(item) for item in value]
+        if isinstance(value, dict):
+            return {key: rewrite_refs(item) for key, item in value.items()}
+        return value
+
+    return PlanSchema(
+        tasks=[
+            TaskSpec(
+                id=id_map[task.id],
+                agent=task.agent,
+                description=task.description,
+                inputs=rewrite_refs(task.inputs),
+                depends_on=[id_map[dep] for dep in task.depends_on],
+            )
+            for task in plan_obj.tasks
+        ],
+        terminal=id_map[plan_obj.terminal],
+        reasoning=plan_obj.reasoning,
+    )
+
+
 @trace("orchestrator_plan")
 async def plan(goal: GoalRow) -> PlanSchema:
     set_execution_context(execution_id=goal.trace_id, agent_id="orchestrator")
@@ -96,7 +133,7 @@ async def plan(goal: GoalRow) -> PlanSchema:
                 model=ORCHESTRATOR_MODEL,
                 messages=messages,
                 tools=[PLAN_TOOL],
-                tool_choice={"type": "function", "name": "submit_plan"},
+                tool_choice={"type": "function", "function": {"name": "submit_plan"}},
                 temperature=0.1,
                 max_tokens=2048,
             )
@@ -135,6 +172,7 @@ def _validate_plan(p: PlanSchema) -> None:
 async def run_plan(goal: GoalRow) -> None:
     """Plan a goal and persist the tasks to the database."""
     plan_obj = await plan(goal)
+    plan_obj = _namespace_plan(plan_obj, goal.id)
     plan_json = plan_obj.model_dump_json()
     tasks_data = [t.model_dump() for t in plan_obj.tasks]
     await db.create_tasks(tasks_data, goal.id, goal.trace_id)

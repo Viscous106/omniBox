@@ -13,6 +13,17 @@ os.environ.setdefault("GROQ_API_KEY", settings.groq_api_key)
 litellm.drop_params = True  # ignore unsupported params per provider
 
 
+def _normalize_tool_choice(tool_choice: dict | str | None) -> dict | str | None:
+    if (
+        isinstance(tool_choice, dict)
+        and tool_choice.get("type") == "function"
+        and "name" in tool_choice
+        and "function" not in tool_choice
+    ):
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    return tool_choice
+
+
 async def acompletion(
     model: str,
     messages: list[dict],
@@ -29,7 +40,7 @@ async def acompletion(
     )
     if tools:
         kwargs["tools"] = tools
-        kwargs["tool_choice"] = tool_choice or "auto"
+        kwargs["tool_choice"] = _normalize_tool_choice(tool_choice) or "auto"
     return await _acompletion(**kwargs)
 
 

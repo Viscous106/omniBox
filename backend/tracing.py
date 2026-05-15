@@ -24,7 +24,7 @@ def init_tracing(api_key: str, project: str) -> None:
         return
     try:
         _omium_module.init(api_key=api_key, project=project)
-        _client = _omium_module.OmiumClient(api_key=api_key)
+        _client = _omium_module.OmiumClient()
         logger.info("Omium tracing initialized (project=%s)", project)
     except Exception as e:
         logger.warning("Omium init failed: %s — tracing disabled", e)

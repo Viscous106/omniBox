@@ -11,3 +11,4 @@ PyGithub
 aiosqlite
 python-dotenv
 sse-starlette
+omium

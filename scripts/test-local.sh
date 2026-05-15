@@ -9,6 +9,7 @@ if [ ! -x .venv/bin/python ]; then
 fi
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m py_compile ./*.py ./api/*.py ./tools/*.py
+.venv/bin/python -m unittest discover -s tests
 
 cd "$ROOT/frontend"
 npm install

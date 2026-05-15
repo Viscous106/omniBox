@@ -9,12 +9,15 @@ import logging
 import uuid
 from typing import Any
 
+import litellm
+
 import db
 import events
 import orchestrator as orch
 from agent_runner import WaitingWebhookSignal, run as agent_run
 from config import settings
 from interpolation import resolve_inputs
+from llm import _rate_limit_delay
 from state import GoalStatus, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -108,8 +111,8 @@ async def _execute_task(task: Any) -> None:
         resolved = resolve_inputs(task.inputs, task_outputs)
     except KeyError as e:
         logger.error("Interpolation failed for task %s: %s", task.id, e)
-        await db.settle_task(task.id, TaskStatus.FAILED, error=f"Interpolation error: {e}")
-        events.emit(goal_id, "task_update", {"task_id": task.id, "status": TaskStatus.FAILED})
+        await db.settle_task(task.id, TaskStatus.PENDING, error=f"Waiting for dependency output: {e}")
+        events.emit(goal_id, "task_update", {"task_id": task.id, "status": TaskStatus.PENDING})
         return
 
     try:
@@ -122,6 +125,13 @@ async def _execute_task(task: Any) -> None:
     except WaitingWebhookSignal:
         # Already handled inside agent_run (status set to WAITING_WEBHOOK in DB)
         events.emit(goal_id, "task_update", {"task_id": task.id, "status": TaskStatus.WAITING_WEBHOOK})
+
+    except litellm.RateLimitError as e:
+        delay = _rate_limit_delay(e, 0)
+        logger.warning("Task %s rate limited; requeueing after %.2fs: %s", task.id, min(delay, 300), e)
+        await asyncio.sleep(min(delay, 300))
+        await db.settle_task(task.id, TaskStatus.READY, error=f"Rate limited; retrying: {e}")
+        events.emit(goal_id, "task_update", {"task_id": task.id, "status": TaskStatus.READY})
 
     except Exception as e:
         logger.error("Task %s FAILED: %s", task.id, e)

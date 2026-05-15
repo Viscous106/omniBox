@@ -288,7 +288,17 @@ async def claim_ready_task(worker_id: str, lease_secs: int) -> TaskRow | None:
             await conn.execute(
                 """UPDATE tasks SET status='RUNNING', worker_id=?, lease_expires_at=?,
                    attempt_count=attempt_count+1, updated_at=?
-                   WHERE id=(SELECT id FROM tasks WHERE status='READY' ORDER BY created_at LIMIT 1)
+                   WHERE id=(
+                       SELECT id FROM tasks
+                       WHERE status='READY'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM json_each(depends_on) dep
+                           JOIN tasks t ON t.id=dep.value
+                           WHERE t.status != 'DONE'
+                         )
+                       ORDER BY created_at
+                       LIMIT 1
+                   )
                    RETURNING *""",
                 (worker_id, now + lease_secs, now),
             )

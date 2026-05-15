@@ -52,4 +52,15 @@ if _frontend_dist.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host=settings.host, port=settings.port, reload=True)
+    uvicorn.run(
+        "main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=True,
+        reload_excludes=[
+            "workspace/*",
+            "omnibox.db",
+            "omnibox.db-*",
+            "__pycache__/*",
+        ],
+    )

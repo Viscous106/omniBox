@@ -6,8 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from typing import Any, Callable
+
+import litellm
 
 import db
 from agent_registry import AGENT_REGISTRY
@@ -18,6 +21,8 @@ from tools.wait_webhook import WAITING_WEBHOOK_SENTINEL
 from tracing import set_execution_context, trace
 
 logger = logging.getLogger(__name__)
+
+FAILED_GENERATION_RE = re.compile(r"<function=(.+?)>(.*?)</function>", re.DOTALL)
 
 SUBMIT_RESULT_TOOL = {
     "type": "function",
@@ -65,6 +70,43 @@ def _args_hash(args_json: str) -> str:
     return hashlib.sha256(args_json.encode()).hexdigest()
 
 
+def _recover_failed_tool_call(error: Exception) -> tuple[str, str, dict] | None:
+    marker = "GroqException - "
+    message = str(error)
+    if marker not in message:
+        return None
+    try:
+        payload = json.loads(message.split(marker, 1)[1])
+        failed_generation = payload["error"]["failed_generation"]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return None
+
+    match = FAILED_GENERATION_RE.search(failed_generation.strip())
+    if not match:
+        return None
+
+    raw_head, raw_body = match.groups()
+    raw_head = raw_head.strip()
+    raw_body = raw_body.strip()
+
+    if " " in raw_head:
+        tool_name, head_rest = raw_head.split(" ", 1)
+        args_json = (head_rest + raw_body).strip()
+    elif "{" in raw_head:
+        tool_name, head_rest = raw_head.split("{", 1)
+        args_json = ("{" + head_rest + raw_body).strip()
+    else:
+        tool_name = raw_head
+        args_json = raw_body
+
+    tool_name = tool_name.strip()
+    try:
+        args = json.loads(args_json)
+    except json.JSONDecodeError:
+        return None
+    return tool_name, args_json, args
+
+
 @trace("agent_run")
 async def run(
     task: TaskRow,
@@ -96,7 +138,47 @@ async def run(
     await db.save_message(task.id, "user", user_content, sequence=0)
 
     for iteration in range(max_iter):
-        response = await acompletion(model=model, messages=messages, tools=tools, temperature=0.1)
+        try:
+            response = await acompletion(model=model, messages=messages, tools=tools, temperature=0.1)
+        except litellm.BadRequestError as e:
+            recovered = _recover_failed_tool_call(e)
+            if not recovered:
+                raise
+
+            tool_name, args_str, args = recovered
+            tc_id = f"recovered_{uuid.uuid4().hex}"
+            logger.warning("Recovered malformed Groq tool call for task %s: %s", task.id, tool_name)
+
+            if tool_name == "submit_result":
+                result = args.get("result", args)
+                logger.info("Agent %s submitted recovered result for task %s", task.agent_name, task.id)
+                return result
+
+            ikey = _idempotency_key(task.id, tool_name, args_str, task.attempt_count)
+
+            if emit:
+                emit("tool_call", {"task_id": task.id, "tool": tool_name, "args": args})
+
+            result = await _execute_tool_idempotent(task, tool_name, args_str, args, ikey)
+
+            if isinstance(result, dict) and result.get(WAITING_WEBHOOK_SENTINEL):
+                wait_token = result["wait_token"]
+                await db.set_task_waiting_webhook(task.id, wait_token)
+                if emit:
+                    emit("task_waiting", {"task_id": task.id, "wait_token": wait_token, "webhook_url": result["webhook_url"]})
+                raise WaitingWebhookSignal(wait_token)
+
+            if emit:
+                emit("tool_result", {"task_id": task.id, "tool": tool_name, "status": "SUCCESS"})
+
+            result_str = json.dumps(result)
+            await db.save_message(task.id, "tool", result_str, sequence=len(messages) + iteration + 1, tool_call_id=tc_id)
+            messages.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": tc_id, "type": "function", "function": {"name": tool_name, "arguments": args_str}}
+            ]})
+            messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_str})
+            continue
+
         msg = response.choices[0].message
 
         assistant_content = msg.content or ""

@@ -10,7 +10,8 @@ WORKSPACE = Path(settings.workspace_dir)
 def _safe_path(goal_id: str, rel_path: str) -> Path:
     base = WORKSPACE / goal_id
     base.mkdir(parents=True, exist_ok=True)
-    resolved = (base / rel_path).resolve()
+    candidate = Path(rel_path)
+    resolved = candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
     if not str(resolved).startswith(str(base.resolve())):
         raise ValueError(f"Path traversal attempt: {rel_path}")
     return resolved
@@ -22,9 +23,10 @@ async def file_ops(args: dict) -> dict:
     path = args["path"]
     content = args.get("content", "")
     goal_id = args.get("_goal_id", "shared")
+    goal_base = (WORKSPACE / goal_id).resolve()
 
     if operation == "list":
-        base = WORKSPACE / goal_id
+        base = goal_base
         base.mkdir(parents=True, exist_ok=True)
         files = [str(p.relative_to(base)) for p in base.rglob("*") if p.is_file()]
         return {"files": files, "ok": True}
@@ -39,7 +41,7 @@ async def file_ops(args: dict) -> dict:
     if operation == "write":
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content)
-        return {"ok": True, "path": str(full_path.relative_to(WORKSPACE / goal_id))}
+        return {"ok": True, "path": str(full_path.relative_to(goal_base))}
 
     if operation == "append":
         full_path.parent.mkdir(parents=True, exist_ok=True)

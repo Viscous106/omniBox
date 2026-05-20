@@ -524,3 +524,27 @@ Local testing: `ngrok http 8000` → paste URL into GitHub repo webhook settings
 - Webhook endpoint creates goal correctly (200 OK, goal_id returned)
 - 3-agent DAG planned and executing: researcher DONE → coder RUNNING → integrator PENDING
 - Frontend builds clean (0 TypeScript errors)
+
+---
+
+## Session — Human-in-the-Loop Plan Editor & Interactive Debugger
+**Date:** 2026-05-20
+
+### Backend
+- **`state.py`**: Added `PLANNING_COMPLETED`, `WAITING_APPROVAL` goal/task statuses
+- **`db.py`**: Schema migrations — `goals.is_paused`, `goals.requires_plan_approval`, `goals.step_mode`, `tasks.requires_approval`, `tasks.model_override`; `set_goal_plan()` now sets `PLANNING_COMPLETED`; new functions `approve_goal`, `replace_goal_plan`, `approve_task`, `enforce_approval_gates`, `claim_next_task_for_goal`
+- **`worker.py`**: Auto-approves plans by default (backward compatible); approval gate enforcement + SSE `task_approval_required`; pause/step execution helpers
+- **`api/goals.py`**: `PUT /plan`, `POST /approve`, `POST /pause`, `POST /resume`, `POST /step`
+- **`api/tasks.py`**: `POST /tasks/{id}/approve`
+- **`agent_runner.py`**: Honors per-task `model_override`
+
+### Frontend
+- **`TaskDAG.tsx`**: Interactive React Flow — drag nodes, connect/disconnect edges, settings gear → editor drawer
+- **`GoalDetail.tsx`**: Debug control bar (Save Plan, Approve & Run, Pause/Resume, Step Next), task approval modal overlay, plan editing in `PLANNING_COMPLETED` or while paused
+- **`lib/api.ts`**: New API wrappers for plan editing and debug controls
+- **`StatusBadge.tsx`**: Styles for `PLANNING_COMPLETED`, `WAITING_APPROVAL`
+
+### Behaviour notes
+- Default goal submission auto-starts after planning (unchanged UX for webhooks/GitHub automation)
+- Pass `manual_start: true` on `POST /api/goals` to pause at `PLANNING_COMPLETED` for plan review
+- Task-level approval gates (`requires_approval`) block execution until `POST /api/tasks/{id}/approve`

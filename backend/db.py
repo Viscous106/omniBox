@@ -2,7 +2,7 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 import aiosqlite
 
@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS goals (
     plan_json       TEXT,
     terminal_task_id TEXT,
     trace_id        TEXT NOT NULL,
+    is_paused       INTEGER NOT NULL DEFAULT 0,
+    requires_plan_approval INTEGER NOT NULL DEFAULT 0,
+    step_mode       INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -49,6 +52,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     idempotency_key TEXT UNIQUE,
     trace_id        TEXT NOT NULL,
     parent_span_id  TEXT,
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    model_override  TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
 );
@@ -88,6 +93,13 @@ def _now() -> int:
     return int(time.time())
 
 
+def _row_get(row: aiosqlite.Row, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
 def _row_to_goal(row: aiosqlite.Row) -> GoalRow:
     return GoalRow(
         id=row["id"],
@@ -99,6 +111,9 @@ def _row_to_goal(row: aiosqlite.Row) -> GoalRow:
         plan_json=row["plan_json"],
         terminal_task_id=row["terminal_task_id"],
         trace_id=row["trace_id"],
+        is_paused=bool(_row_get(row, "is_paused", 0)),
+        requires_plan_approval=bool(_row_get(row, "requires_plan_approval", 0)),
+        step_mode=bool(_row_get(row, "step_mode", 0)),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -124,6 +139,8 @@ def _row_to_task(row: aiosqlite.Row) -> TaskRow:
         idempotency_key=row["idempotency_key"],
         trace_id=row["trace_id"],
         parent_span_id=row["parent_span_id"],
+        requires_approval=bool(_row_get(row, "requires_approval", 0)),
+        model_override=_row_get(row, "model_override"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -159,26 +176,34 @@ async def init_db() -> None:
     async with get_conn() as conn:
         await conn.executescript(SCHEMA)
         await conn.commit()
-        # Migrate: add waiting_credential column if not present
-        try:
-            await conn.execute("ALTER TABLE tasks ADD COLUMN waiting_credential TEXT")
-            await conn.commit()
-        except Exception:
-            pass  # column already exists
+        for stmt in (
+            "ALTER TABLE tasks ADD COLUMN waiting_credential TEXT",
+            "ALTER TABLE goals ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE goals ADD COLUMN requires_plan_approval INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE goals ADD COLUMN step_mode INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN model_override TEXT",
+        ):
+            try:
+                await conn.execute(stmt)
+                await conn.commit()
+            except Exception:
+                pass  # column already exists
 
 
 # ── Goals ──────────────────────────────────────────────────────────────────────
 
-async def create_goal(goal_text: str) -> GoalRow:
+async def create_goal(goal_text: str, requires_plan_approval: bool = False) -> GoalRow:
     now = _now()
     goal_id = str(uuid.uuid4())
     trace_id = str(uuid.uuid4())
     title = goal_text[:80] + ("…" if len(goal_text) > 80 else "")
     async with get_conn() as conn:
         await conn.execute(
-            """INSERT INTO goals (id, title, goal_text, status, trace_id, created_at, updated_at)
-               VALUES (?, ?, ?, 'NEW', ?, ?, ?)""",
-            (goal_id, title, goal_text, trace_id, now, now),
+            """INSERT INTO goals
+               (id, title, goal_text, status, trace_id, requires_plan_approval, created_at, updated_at)
+               VALUES (?, ?, ?, 'NEW', ?, ?, ?, ?)""",
+            (goal_id, title, goal_text, trace_id, int(requires_plan_approval), now, now),
         )
         await conn.commit()
         row = await (await conn.execute("SELECT * FROM goals WHERE id=?", (goal_id,))).fetchone()
@@ -224,10 +249,55 @@ async def set_goal_plan(goal_id: str, plan_json: str, terminal_task_id: str) -> 
     now = _now()
     async with get_conn() as conn:
         await conn.execute(
-            "UPDATE goals SET plan_json=?, terminal_task_id=?, status='RUNNING', updated_at=? WHERE id=?",
-            (plan_json, terminal_task_id, now, goal_id),
+            """UPDATE goals SET plan_json=?, terminal_task_id=?, status=?, updated_at=? WHERE id=?""",
+            (plan_json, terminal_task_id, GoalStatus.PLANNING_COMPLETED, now, goal_id),
         )
         await conn.commit()
+
+
+async def approve_goal(goal_id: str) -> GoalRow | None:
+    """Transition goal from PLANNING_COMPLETED to RUNNING and promote initial tasks."""
+    now = _now()
+    async with get_conn() as conn:
+        row = await (
+            await conn.execute(
+                """UPDATE goals SET status=?, is_paused=0, updated_at=?
+                   WHERE id=? AND status=?
+                   RETURNING *""",
+                (GoalStatus.RUNNING, now, goal_id, GoalStatus.PLANNING_COMPLETED),
+            )
+        ).fetchone()
+        await conn.commit()
+    if not row:
+        return None
+    await promote_ready_tasks(goal_id)
+    return _row_to_goal(row)
+
+
+async def set_goal_paused(goal_id: str, paused: bool) -> GoalRow | None:
+    now = _now()
+    async with get_conn() as conn:
+        row = await (
+            await conn.execute(
+                "UPDATE goals SET is_paused=?, updated_at=? WHERE id=? RETURNING *",
+                (int(paused), now, goal_id),
+            )
+        ).fetchone()
+        await conn.commit()
+    return _row_to_goal(row) if row else None
+
+
+async def set_goal_step_mode(goal_id: str, step_mode: bool) -> GoalRow | None:
+    now = _now()
+    async with get_conn() as conn:
+        row = await (
+            await conn.execute(
+                "UPDATE goals SET step_mode=?, updated_at=? WHERE id=? RETURNING *",
+                (int(step_mode), now, goal_id),
+            )
+        ).fetchone()
+        await conn.commit()
+    return _row_to_goal(row) if row else None
 
 
 async def claim_new_goal() -> GoalRow | None:
@@ -249,20 +319,27 @@ async def claim_new_goal() -> GoalRow | None:
 
 async def create_tasks(tasks: list[dict], goal_id: str, trace_id: str) -> list[TaskRow]:
     now = _now()
-    created = []
     async with get_conn() as conn:
         for t in tasks:
             ikey = str(uuid.uuid4())
+            requires_approval = int(t.get("requires_approval", False))
+            initial_status = TaskStatus.PENDING
+            if not t.get("depends_on"):
+                initial_status = (
+                    TaskStatus.WAITING_APPROVAL if requires_approval else TaskStatus.READY
+                )
             await conn.execute(
                 """INSERT INTO tasks
                    (id, goal_id, agent_name, description, inputs, depends_on, status,
-                    idempotency_key, trace_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    requires_approval, model_override, idempotency_key, trace_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     t["id"], goal_id, t["agent"], t["description"],
                     json.dumps(t.get("inputs", {})),
                     json.dumps(t.get("depends_on", [])),
-                    TaskStatus.READY if not t.get("depends_on") else TaskStatus.PENDING,
+                    initial_status,
+                    requires_approval,
+                    t.get("model_override"),
                     ikey, trace_id, now, now,
                 ),
             )
@@ -297,7 +374,12 @@ async def claim_ready_task(worker_id: str, lease_secs: int) -> TaskRow | None:
                    WHERE id=(
                        SELECT candidate.id
                        FROM tasks candidate
+                       JOIN goals g ON g.id = candidate.goal_id
                        WHERE candidate.status='READY'
+                         AND candidate.requires_approval = 0
+                         AND g.status = 'RUNNING'
+                         AND g.is_paused = 0
+                         AND g.step_mode = 0
                          AND NOT EXISTS (
                            SELECT 1
                            FROM json_each(candidate.depends_on) dep
@@ -318,6 +400,42 @@ async def claim_ready_task(worker_id: str, lease_secs: int) -> TaskRow | None:
     return _row_to_task(row) if row else None
 
 
+async def claim_next_task_for_goal(goal_id: str, worker_id: str, lease_secs: int) -> TaskRow | None:
+    """Claim a single ready task for a specific goal (step-debug mode)."""
+    now = _now()
+    async with get_conn() as conn:
+        row = await (
+            await conn.execute(
+                """UPDATE tasks SET status='RUNNING', worker_id=?, lease_expires_at=?,
+                   attempt_count=attempt_count+1, updated_at=?
+                   WHERE id=(
+                       SELECT candidate.id
+                       FROM tasks candidate
+                       JOIN goals g ON g.id = candidate.goal_id
+                       WHERE candidate.goal_id = ?
+                         AND candidate.status='READY'
+                         AND candidate.requires_approval = 0
+                         AND g.status IN ('RUNNING', 'PLANNING_COMPLETED')
+                         AND NOT EXISTS (
+                           SELECT 1
+                           FROM json_each(candidate.depends_on) dep
+                           LEFT JOIN tasks dependency
+                             ON dependency.id=dep.value
+                            AND dependency.goal_id=candidate.goal_id
+                           WHERE dependency.id IS NULL
+                              OR dependency.status != 'DONE'
+                         )
+                       ORDER BY candidate.created_at
+                       LIMIT 1
+                   )
+                   RETURNING *""",
+                (worker_id, now + lease_secs, now, goal_id),
+            )
+        ).fetchone()
+        await conn.commit()
+    return _row_to_task(row) if row else None
+
+
 async def settle_task(task_id: str, status: str, output: dict | None = None, error: str | None = None) -> None:
     now = _now()
     async with get_conn() as conn:
@@ -329,11 +447,15 @@ async def settle_task(task_id: str, status: str, output: dict | None = None, err
 
 
 async def promote_ready_tasks(goal_id: str) -> list[str]:
+    """Promote dependency-satisfied PENDING tasks to READY or WAITING_APPROVAL."""
     now = _now()
     async with get_conn() as conn:
         rows = await (
             await conn.execute(
-                """UPDATE tasks SET status='READY', updated_at=?
+                """UPDATE tasks SET status=CASE
+                       WHEN requires_approval=1 THEN ?
+                       ELSE ?
+                   END, updated_at=?
                    WHERE status='PENDING' AND goal_id=?
                      AND (error IS NULL OR error NOT LIKE 'Rate limited;%')
                      AND NOT EXISTS (
@@ -345,12 +467,146 @@ async def promote_ready_tasks(goal_id: str) -> list[str]:
                        WHERE dependency.id IS NULL
                           OR dependency.status != 'DONE'
                      )
-                   RETURNING id""",
-                (now, goal_id),
+                   RETURNING id, status""",
+                (TaskStatus.WAITING_APPROVAL, TaskStatus.READY, now, goal_id),
             )
         ).fetchall()
         await conn.commit()
     return [r["id"] for r in rows]
+
+
+async def enforce_approval_gates(goal_id: str | None = None) -> list[TaskRow]:
+    """Move READY tasks with requires_approval to WAITING_APPROVAL once deps are satisfied."""
+    now = _now()
+    async with get_conn() as conn:
+        if goal_id:
+            rows = await (
+                await conn.execute(
+                    """UPDATE tasks SET status=?, updated_at=?
+                       WHERE status='READY' AND requires_approval=1 AND goal_id=?
+                         AND NOT EXISTS (
+                           SELECT 1
+                           FROM json_each(tasks.depends_on) dep
+                           LEFT JOIN tasks dependency
+                             ON dependency.id=dep.value
+                            AND dependency.goal_id=tasks.goal_id
+                           WHERE dependency.id IS NULL
+                              OR dependency.status != 'DONE'
+                         )
+                       RETURNING *""",
+                    (TaskStatus.WAITING_APPROVAL, now, goal_id),
+                )
+            ).fetchall()
+        else:
+            rows = await (
+                await conn.execute(
+                    """UPDATE tasks SET status=?, updated_at=?
+                       WHERE status='READY' AND requires_approval=1
+                         AND NOT EXISTS (
+                           SELECT 1
+                           FROM json_each(tasks.depends_on) dep
+                           LEFT JOIN tasks dependency
+                             ON dependency.id=dep.value
+                            AND dependency.goal_id=tasks.goal_id
+                           WHERE dependency.id IS NULL
+                              OR dependency.status != 'DONE'
+                         )
+                       RETURNING *""",
+                    (TaskStatus.WAITING_APPROVAL, now),
+                )
+            ).fetchall()
+        await conn.commit()
+    return [_row_to_task(r) for r in rows]
+
+
+async def approve_task(task_id: str, inputs: dict | None = None) -> TaskRow | None:
+    now = _now()
+    async with get_conn() as conn:
+        if inputs is not None:
+            await conn.execute(
+                "UPDATE tasks SET inputs=?, updated_at=? WHERE id=?",
+                (json.dumps(inputs), now, task_id),
+            )
+        row = await (
+            await conn.execute(
+                """UPDATE tasks SET status=?, requires_approval=0, updated_at=?
+                   WHERE id=? AND status=? AND requires_approval=1
+                   RETURNING *""",
+                (TaskStatus.READY, now, task_id, TaskStatus.WAITING_APPROVAL),
+            )
+        ).fetchone()
+        await conn.commit()
+    return _row_to_task(row) if row else None
+
+
+async def replace_goal_plan(
+    goal_id: str,
+    tasks: list[dict],
+    terminal_task_id: str,
+    plan_json: str,
+) -> list[TaskRow]:
+    """Replace un-executed tasks with a user-edited plan graph."""
+    now = _now()
+    terminal_statuses = {TaskStatus.DONE, TaskStatus.RUNNING}
+    async with get_conn() as conn:
+        existing = await (
+            await conn.execute("SELECT id, status FROM tasks WHERE goal_id=?", (goal_id,))
+        ).fetchall()
+        protected = {r["id"] for r in existing if r["status"] in terminal_statuses}
+        if terminal_task_id in protected:
+            raise ValueError("Cannot change terminal task after it has started or completed")
+
+        deletable = [
+            r["id"] for r in existing
+            if r["status"] not in terminal_statuses and r["id"] not in protected
+        ]
+        for tid in deletable:
+            await conn.execute("DELETE FROM messages WHERE task_id=?", (tid,))
+            await conn.execute("DELETE FROM tool_calls WHERE task_id=?", (tid,))
+            await conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+
+        goal_row = await (await conn.execute("SELECT trace_id FROM goals WHERE id=?", (goal_id,))).fetchone()
+        if not goal_row:
+            raise ValueError("Goal not found")
+        trace_id = goal_row["trace_id"]
+
+        for t in tasks:
+            if t["id"] in protected:
+                continue
+            ikey = str(uuid.uuid4())
+            requires_approval = int(t.get("requires_approval", False))
+            has_deps = bool(t.get("depends_on"))
+            if has_deps:
+                initial_status = TaskStatus.PENDING
+            else:
+                initial_status = (
+                    TaskStatus.WAITING_APPROVAL if requires_approval else TaskStatus.READY
+                )
+            await conn.execute(
+                """INSERT OR REPLACE INTO tasks
+                   (id, goal_id, agent_name, description, inputs, depends_on, status,
+                    requires_approval, model_override, idempotency_key, trace_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    t["id"], goal_id, t["agent"], t["description"],
+                    json.dumps(t.get("inputs", {})),
+                    json.dumps(t.get("depends_on", [])),
+                    initial_status,
+                    requires_approval,
+                    t.get("model_override"),
+                    ikey, trace_id, now, now,
+                ),
+            )
+
+        await conn.execute(
+            "UPDATE goals SET plan_json=?, terminal_task_id=?, updated_at=? WHERE id=?",
+            (plan_json, terminal_task_id, now, goal_id),
+        )
+        await conn.commit()
+        rows = await (
+            await conn.execute("SELECT * FROM tasks WHERE goal_id=? ORDER BY created_at", (goal_id,))
+        ).fetchall()
+    return [_row_to_task(r) for r in rows]
 
 
 async def reclaim_expired_leases() -> int:
@@ -415,7 +671,7 @@ async def find_orphaned_goals() -> list[dict]:
                        t.output  AS terminal_output_json
                 FROM goals g
                 LEFT JOIN tasks t ON t.id = g.terminal_task_id
-                WHERE g.status IN ('RUNNING', 'PLANNING')
+                WHERE g.status IN ('RUNNING', 'PLANNING', 'PLANNING_COMPLETED')
                   AND g.terminal_task_id IS NOT NULL
                   AND NOT EXISTS (
                     SELECT 1 FROM tasks sub

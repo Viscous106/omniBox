@@ -43,13 +43,14 @@ omniBox is a generic multi-agent autonomy system: a user submits any natural lan
 **Entry point**: `main.py` — FastAPI app with lifespan that initializes DB, starts the worker, registers all routers, and optionally serves the frontend static build.
 
 **Core execution loop** (`worker.py`):
-- `goal_planner_loop` — polls NEW goals → calls `orchestrator.run_plan()` → creates task rows
-- `task_executor_loop` — polls READY tasks → runs `agent_runner.run()` — up to 5 concurrent (Semaphore)
+- `goal_planner_loop` — polls NEW goals → calls `orchestrator.run_plan()` → creates task rows → sets goal to `PLANNING_COMPLETED` (auto-approves to `RUNNING` unless `requires_plan_approval=1`)
+- `task_executor_loop` — polls READY tasks → runs `agent_runner.run()` — up to 5 concurrent (Semaphore); skips paused goals, step-mode goals, and tasks with `requires_approval=1`; runs `enforce_approval_gates()` to move gated tasks to `WAITING_APPROVAL`
 - `reclaim_loop` — every 30s, reclaims RUNNING tasks with expired leases back to READY
+- `approve_goal_execution()` / `step_goal_execution()` — callable from API for human-in-the-loop plan approval and single-step debugging
 
 **Orchestrator** (`orchestrator.py`): Uses the model from `model_config.get_model("orchestrator")` (defaults to `groq/llama-3.3-70b-versatile`). Forced tool call → `PlanSchema` (task DAG JSON). Retries 5x with rate-limit backoff. Handles Groq `tool_use_failed` by salvaging the plan from `failed_generation` in the error response (`_salvage_failed_generation()`). Falls back to `tool_choice="auto"` on attempts 2+. Task IDs are prefixed with `goal.id[:8]_` to avoid UNIQUE constraint collisions. `_rewrite_templates()` rewrites `{{t1.output.field[0]}}` refs to include the prefix.
 
-**Agent runner** (`agent_runner.py`): Generic LLM tool-call loop. Reads agent config via `get_agent_config(name)` (reads live model from `model_config` on every call), calls `acompletion()` in a loop until the agent calls `submit_result`. Idempotency: each tool invocation is hashed and cached in `tool_calls` table — re-runs return the stored result without re-firing. Includes: exponential backoff for rate limits, retry-hint injection for Groq `tool_use_failed` errors, `consecutive_errors` counter that forces a "use your knowledge and submit NOW" message after 3 consecutive tool failures, and an early-warning nudge at `max_iter - 3`.
+**Agent runner** (`agent_runner.py`): Generic LLM tool-call loop. Reads agent config via `get_agent_config(name)` (reads live model from `model_config` on every call), uses per-task `model_override` when set, calls `acompletion()` in a loop until the agent calls `submit_result`. Idempotency: each tool invocation is hashed and cached in `tool_calls` table. Includes rate-limit backoff, Groq `tool_use_failed` retry hints, and consecutive-error nudges.
 
 **Agents** (`agent_registry.py`): `researcher` (web_search, http_request, **github_read_file, github_list_dir, github_get_issue, github_search_code**), `writer` (file_ops), `notifier` (slack_notify, http_request), `coder` (code_exec, file_ops, web_search, **github_read_file**), `integrator` (**github_pr, github_post_comment, github_read_file**, http_request, wait_webhook). All go through the same `agent_runner.run()`. Use `get_agent_config(name)` — not `AGENT_REGISTRY[name]` directly — to get the live model setting.
 
@@ -59,7 +60,7 @@ omniBox is a generic multi-agent autonomy system: a user submits any natural lan
 
 **Tools** (`tools/`): `web_search` (Tavily → DuckDuckGo fallback → training-knowledge note), `http_request` (httpx), `slack_notify`, `file_ops` (workspace-scoped, path traversal protected), `github_pr` (create PR with file commits), `github_read_file` / `github_list_dir` / `github_get_issue` / `github_post_comment` / `github_search_code` (GitHub API operations in `tools/github_ops.py`), `code_exec` (subprocess, 30s timeout), `wait_webhook` (suspends task to `WAITING_WEBHOOK` state).
 
-**Persistence** (`db.py`): SQLite WAL mode, `aiosqlite`. Tables: `goals`, `tasks`, `messages`, `tool_calls`. Task claim is atomic via `UPDATE ... WHERE id=(SELECT ... LIMIT 1) RETURNING *`.
+**Persistence** (`db.py`): SQLite WAL mode, `aiosqlite`. Tables: `goals`, `tasks`, `messages`, `tool_calls`. Goals have `is_paused`, `requires_plan_approval`, `step_mode`. Tasks have `requires_approval`, `model_override`. Task claim is atomic via `UPDATE ... WHERE id=(SELECT ... LIMIT 1) RETURNING *` and only claims from `RUNNING` non-paused goals.
 
 **SSE** (`api/stream.py` + `events.py`): In-process `asyncio.Queue` per goal. Worker calls `events.emit()`, stream endpoint drains the queue via Server-Sent Events.
 
@@ -75,7 +76,8 @@ Vite + React + TypeScript + Tailwind CSS + Framer Motion + React Flow + SWR.
 
 - `pages/Dashboard.tsx` — goal list + submission input, stats strip, status filters
 - `pages/Webhooks.tsx` — GitHub Automation page at `/app/webhooks`; shows webhook URL with copy button, setup guide (ngrok + GitHub settings), and a "Simulate GitHub Issue" form for testing without a real webhook
-- `pages/GoalDetail.tsx` — split-pane: task DAG (React Flow) + expandable task panels + live SSE log
+- `pages/GoalDetail.tsx` — split-pane: interactive task DAG (React Flow plan editor when `PLANNING_COMPLETED` or paused) + debug control bar (pause/resume, step, approve plan) + task approval overlay + expandable task panels + live SSE log
+- `components/TaskDAG.tsx` — React Flow DAG; editable mode supports drag, connect/disconnect edges, per-node settings gear → editor drawer (agent, model override, inputs JSON, approval gate toggle)
 - `components/AppNav.tsx` — sticky nav with Dashboard / Models / API Docs links; active-route highlighting
 - `pages/Models.tsx` — full-page model config at `/app/models`; Visual tab (per-role cards + custom model input) and JSON tab (raw editor + live validation); API Keys section (all 6 providers, inline key input, saves to `.env` live)
 - `components/ModelErrorBanner.tsx` — centered modal that appears on goal failure when error is key/quota related; detects provider from error string; inline key input + "Change model" button
@@ -90,10 +92,16 @@ All routes under `/api/`. Key endpoints:
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/goals` | Submit goal → 202 |
+| POST | `/api/goals` | Submit goal → 202 (`manual_start: true` waits for plan approval) |
 | GET | `/api/goals` | List goals |
 | GET | `/api/goals/{id}` | Full status + tasks + output |
-| GET | `/api/goals/{id}/stream` | SSE event stream |
+| PUT | `/api/goals/{id}/plan` | Replace un-executed tasks with user-edited DAG |
+| POST | `/api/goals/{id}/approve` | Approve plan → start execution |
+| POST | `/api/goals/{id}/pause` | Pause goal execution |
+| POST | `/api/goals/{id}/resume` | Resume goal execution |
+| POST | `/api/goals/{id}/step` | Execute next ready task (debug step mode) |
+| POST | `/api/tasks/{id}/approve` | Approve gated task (optional modified inputs) |
+| GET | `/api/goals/{id}/stream` | SSE event stream (`task_approval_required`, `plan_updated`) |
 | GET | `/api/config/models` | Get per-role model config |
 | PUT | `/api/config/models` | Update per-role model config |
 | GET | `/api/config/keys` | Get provider API key status (masked) |

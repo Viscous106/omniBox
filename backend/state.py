@@ -13,6 +13,9 @@ class GoalRow:
     plan_json: str | None
     terminal_task_id: str | None
     trace_id: str
+    is_paused: bool
+    requires_plan_approval: bool
+    step_mode: bool
     created_at: int
     updated_at: int
 
@@ -37,6 +40,8 @@ class TaskRow:
     idempotency_key: str
     trace_id: str
     parent_span_id: str | None
+    requires_approval: bool
+    model_override: str | None
     created_at: int
     updated_at: int
 
@@ -71,9 +76,11 @@ class MessageRow:
 class GoalStatus:
     NEW = "NEW"
     PLANNING = "PLANNING"
+    PLANNING_COMPLETED = "PLANNING_COMPLETED"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
 
 
 # Task status constants
@@ -85,3 +92,4 @@ class TaskStatus:
     FAILED = "FAILED"
     WAITING_WEBHOOK = "WAITING_WEBHOOK"
     WAITING_CREDENTIAL = "WAITING_CREDENTIAL"
+    WAITING_APPROVAL = "WAITING_APPROVAL"

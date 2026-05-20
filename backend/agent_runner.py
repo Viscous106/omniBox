@@ -127,7 +127,7 @@ async def run(
     set_execution_context(execution_id=task.trace_id, agent_id=f"{task.agent_name}/{task.id}")
 
     tools = _build_tool_defs(config["allowed_tools"])
-    model = config["model"]
+    model = task.model_override or config["model"]
     max_iter = config["max_iterations"]
 
     import context as ctx_store

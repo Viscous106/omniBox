@@ -50,6 +50,40 @@ async def stop() -> None:
     _running = False
 
 
+async def approve_goal_execution(goal_id: str) -> bool:
+    """Approve a plan and start execution (called from API)."""
+    approved = await db.approve_goal(goal_id)
+    if not approved:
+        return False
+    promoted = await db.promote_ready_tasks(goal_id)
+    for tid in promoted:
+        task = await db.get_task(tid)
+        if task and task.status == TaskStatus.WAITING_APPROVAL:
+            events.emit(goal_id, "task_approval_required", {
+                "task_id": tid, "agent": task.agent_name,
+                "description": task.description, "inputs": task.inputs,
+            })
+        else:
+            events.emit(goal_id, "task_update", {"task_id": tid, "status": TaskStatus.READY})
+    events.emit(goal_id, "goal_status", {"status": GoalStatus.RUNNING, "goal_id": goal_id})
+    return True
+
+
+async def step_goal_execution(goal_id: str) -> Any | None:
+    """Execute the next ready task for a goal (debug step mode)."""
+    goal = await db.get_goal(goal_id)
+    if not goal:
+        return None
+    if goal.status == GoalStatus.PLANNING_COMPLETED:
+        await db.approve_goal(goal_id)
+        events.emit(goal_id, "goal_status", {"status": GoalStatus.RUNNING, "goal_id": goal_id})
+    task = await db.claim_next_task_for_goal(goal_id, _worker_id, settings.lease_seconds)
+    if not task:
+        return None
+    asyncio.create_task(_execute_task(task), name=f"step-{task.id}")
+    return task
+
+
 # ── Planner ─────────────────────────────────────────────────────────────────────
 
 async def _goal_planner_loop() -> None:
@@ -70,8 +104,26 @@ async def _plan_goal(goal: Any) -> None:
     with goal_trace_context(execution_id=goal.trace_id, goal_title=goal.title):
         try:
             await orch.run_plan(goal)
-            events.emit(goal.id, "goal_status", {"status": GoalStatus.RUNNING, "goal_id": goal.id})
-            logger.info("Goal %s planned successfully", goal.id)
+            fresh = await db.get_goal(goal.id)
+            events.emit(goal.id, "goal_status", {
+                "status": GoalStatus.PLANNING_COMPLETED, "goal_id": goal.id,
+            })
+            logger.info("Goal %s plan ready (awaiting approval=%s)", goal.id, fresh.requires_plan_approval if fresh else False)
+            if fresh and not fresh.requires_plan_approval:
+                approved = await db.approve_goal(goal.id)
+                if approved:
+                    promoted = await db.promote_ready_tasks(goal.id)
+                    for tid in promoted:
+                        task = await db.get_task(tid)
+                        if task and task.status == TaskStatus.WAITING_APPROVAL:
+                            events.emit(goal.id, "task_approval_required", {
+                                "task_id": tid, "agent": task.agent_name,
+                                "description": task.description,
+                            })
+                        else:
+                            events.emit(goal.id, "task_update", {"task_id": tid, "status": TaskStatus.READY})
+                    events.emit(goal.id, "goal_status", {"status": GoalStatus.RUNNING, "goal_id": goal.id})
+                    logger.info("Goal %s auto-approved and running", goal.id)
         except Exception as e:
             logger.error("Planning failed for goal %s: %s", goal.id, e)
             await db.update_goal_status(goal.id, GoalStatus.FAILED, error=str(e))
@@ -84,6 +136,14 @@ async def _task_executor_loop() -> None:
     semaphore = asyncio.Semaphore(settings.max_concurrent_tasks)
     while _running:
         try:
+            gated = await db.enforce_approval_gates()
+            for task in gated:
+                events.emit(task.goal_id, "task_approval_required", {
+                    "task_id": task.id,
+                    "agent": task.agent_name,
+                    "description": task.description,
+                    "inputs": task.inputs,
+                })
             task = await db.claim_ready_task(_worker_id, settings.lease_seconds)
             if task:
                 asyncio.create_task(
@@ -206,7 +266,13 @@ async def _after_task_done(task: Any, output: dict) -> None:
 
     promoted = await db.promote_ready_tasks(task.goal_id)
     for tid in promoted:
-        events.emit(task.goal_id, "task_update", {"task_id": tid, "status": TaskStatus.READY})
+        t = await db.get_task(tid)
+        if t and t.status == TaskStatus.WAITING_APPROVAL:
+            events.emit(task.goal_id, "task_approval_required", {
+                "task_id": tid, "agent": t.agent_name, "description": t.description, "inputs": t.inputs,
+            })
+        else:
+            events.emit(task.goal_id, "task_update", {"task_id": tid, "status": TaskStatus.READY})
 
     if goal.terminal_task_id == task.id:
         await db.update_goal_status(task.goal_id, GoalStatus.COMPLETED, output=output)

@@ -15,6 +15,12 @@ backend/context.json
 backend/omnibox.db
 backend/omnibox.db-*
 backend/workspace/
+backend/logs/
+frontend/omnibox.db
+*.db-wal
+*.db-shm
+.env.production
+.env.local
 
 # Frontend
 frontend/node_modules/

@@ -32,8 +32,20 @@ export interface TaskDetail {
   attempt_count: number;
   wait_token: string | null;
   depends_on?: string[];
+  requires_approval?: boolean;
+  model_override?: string | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface PlanTaskInput {
+  id: string;
+  agent: string;
+  description: string;
+  inputs?: Record<string, unknown>;
+  depends_on?: string[];
+  requires_approval?: boolean;
+  model_override?: string | null;
 }
 
 export interface GoalDetail {
@@ -43,9 +55,12 @@ export interface GoalDetail {
   status: string;
   output: Record<string, unknown> | null;
   error: string | null;
-  plan: unknown;
+  plan: { terminal?: string; tasks?: PlanTaskInput[] } | null;
   tasks: TaskDetail[];
   trace_id: string;
+  is_paused?: boolean;
+  requires_plan_approval?: boolean;
+  step_mode?: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -122,5 +137,29 @@ export const api = {
     request<{ ok: boolean } & ProjectContext>("/config/context", {
       method: "PUT",
       body: JSON.stringify(ctx),
+    }),
+
+  updatePlan: (goalId: string, tasks: PlanTaskInput[], terminal: string) =>
+    request<GoalDetail>(`/goals/${goalId}/plan`, {
+      method: "PUT",
+      body: JSON.stringify({ tasks, terminal }),
+    }),
+
+  approveGoal: (goalId: string) =>
+    request<{ ok: boolean; status: string }>(`/goals/${goalId}/approve`, { method: "POST" }),
+
+  pauseGoal: (goalId: string) =>
+    request<{ ok: boolean; is_paused: boolean }>(`/goals/${goalId}/pause`, { method: "POST" }),
+
+  resumeGoal: (goalId: string) =>
+    request<{ ok: boolean; is_paused: boolean }>(`/goals/${goalId}/resume`, { method: "POST" }),
+
+  stepGoal: (goalId: string) =>
+    request<{ ok: boolean; task_id: string; status: string }>(`/goals/${goalId}/step`, { method: "POST" }),
+
+  approveTask: (taskId: string, inputs?: Record<string, unknown>) =>
+    request<TaskDetail>(`/tasks/${taskId}/approve`, {
+      method: "POST",
+      body: JSON.stringify(inputs ? { inputs } : {}),
     }),
 };

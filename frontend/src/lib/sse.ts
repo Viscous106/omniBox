@@ -29,6 +29,8 @@ export function useSSE(goalId: string | undefined, active: boolean) {
       "task_update",
       "task_done",
       "task_waiting",
+      "task_approval_required",
+      "plan_updated",
       "credential_request",
       "goal_done",
       "tool_call",
